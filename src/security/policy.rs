@@ -438,7 +438,8 @@ impl SecurityPolicy {
                     | "ssh"
                     | "ftp"
                     | "telnet"
-            ) {
+            ) || (base == "git" && args.first().is_some_and(|v| v == "clone"))
+            {
                 return CommandRiskLevel::High;
             }
 
@@ -466,18 +467,38 @@ impl SecurityPolicy {
                             | "checkout"
                             | "switch"
                             | "tag"
+                            | "init"
+                            | "remote"
                     )
                 }),
                 "npm" | "pnpm" | "yarn" => args.first().is_some_and(|verb| {
                     matches!(
                         verb.as_str(),
-                        "install" | "add" | "remove" | "uninstall" | "update" | "publish"
+                        "install"
+                            | "add"
+                            | "remove"
+                            | "uninstall"
+                            | "update"
+                            | "publish"
+                            | "run"
+                            | "run-script"
+                            | "exec"
+                            | "test"
                     )
                 }),
                 "cargo" => args.first().is_some_and(|verb| {
                     matches!(
                         verb.as_str(),
-                        "add" | "remove" | "install" | "clean" | "publish"
+                        "add"
+                            | "remove"
+                            | "install"
+                            | "clean"
+                            | "publish"
+                            | "run"
+                            | "test"
+                            | "bench"
+                            | "check"
+                            | "build"
                     )
                 }),
                 "touch" | "mkdir" | "mv" | "cp" | "ln" => true,
@@ -613,8 +634,13 @@ impl SecurityPolicy {
                 return false;
             }
 
-            // Validate arguments for the command
+            // Validate arguments for the command.
+            // Any argument that is a forbidden path or absolute (when workspace-only) is blocked.
             let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+            if args.iter().any(|arg| !self.is_path_allowed(arg)) {
+                return false;
+            }
+
             if !self.is_args_safe(base_cmd, &args) {
                 return false;
             }
@@ -993,13 +1019,31 @@ mod tests {
     #[test]
     fn command_risk_high_for_dangerous_commands() {
         let p = SecurityPolicy {
-            allowed_commands: vec!["rm".into()],
+            allowed_commands: vec!["rm".into(), "git".into()],
             ..SecurityPolicy::default()
         };
         assert_eq!(
             p.command_risk_level("rm -rf /tmp/test"),
             CommandRiskLevel::High
         );
+        assert_eq!(
+            p.command_risk_level("git clone https://github.com/user/repo"),
+            CommandRiskLevel::High
+        );
+    }
+
+    #[test]
+    fn command_risk_medium_for_build_tools() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["cargo".into(), "npm".into(), "git".into()],
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(p.command_risk_level("cargo build"), CommandRiskLevel::Medium);
+        assert_eq!(p.command_risk_level("cargo test"), CommandRiskLevel::Medium);
+        assert_eq!(p.command_risk_level("npm run build"), CommandRiskLevel::Medium);
+        assert_eq!(p.command_risk_level("npm test"), CommandRiskLevel::Medium);
+        assert_eq!(p.command_risk_level("git init"), CommandRiskLevel::Medium);
+        assert_eq!(p.command_risk_level("git remote add origin ..."), CommandRiskLevel::Medium);
     }
 
     #[test]
@@ -1027,7 +1071,8 @@ mod tests {
             ..SecurityPolicy::default()
         };
 
-        let result = p.validate_command_execution("rm -rf /tmp/test", true);
+        // Use a relative path so it passes is_command_allowed but fails risk check
+        let result = p.validate_command_execution("rm -rf some_file", true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("high-risk"));
     }
@@ -1246,12 +1291,13 @@ mod tests {
             allowed_commands: vec!["sqlite3".into()],
             ..SecurityPolicy::default()
         };
+        // Use relative path to avoid workspace-only block
         assert!(p.is_command_allowed(
-            "sqlite3 /tmp/test.db \"CREATE TABLE t(id INT); INSERT INTO t VALUES(1); SELECT * FROM t;\""
+            "sqlite3 test.db \"CREATE TABLE t(id INT); INSERT INTO t VALUES(1); SELECT * FROM t;\""
         ));
         assert_eq!(
             p.command_risk_level(
-                "sqlite3 /tmp/test.db \"CREATE TABLE t(id INT); INSERT INTO t VALUES(1); SELECT * FROM t;\""
+                "sqlite3 test.db \"CREATE TABLE t(id INT); INSERT INTO t VALUES(1); SELECT * FROM t;\""
             ),
             CommandRiskLevel::Low
         );
@@ -1349,6 +1395,19 @@ mod tests {
         assert!(p.is_command_allowed("find . -name '*.txt'"));
         assert!(p.is_command_allowed("git status"));
         assert!(p.is_command_allowed("git add ."));
+    }
+
+    #[test]
+    fn command_blocks_access_to_forbidden_paths_in_arguments() {
+        let p = SecurityPolicy {
+            workspace_only: true,
+            forbidden_paths: vec!["/etc".into()],
+            ..SecurityPolicy::default()
+        };
+        // This should be blocked because /etc is forbidden
+        assert!(!p.is_command_allowed("find /etc -name hosts"), "find /etc should be blocked");
+        assert!(!p.is_command_allowed("ls /etc"), "ls /etc should be blocked");
+        assert!(!p.is_command_allowed("cat /etc/passwd"), "cat /etc/passwd should be blocked");
     }
 
     #[test]
